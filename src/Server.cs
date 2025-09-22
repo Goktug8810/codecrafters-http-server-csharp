@@ -18,9 +18,27 @@ string[] parts = requestLine.Split(' ');
 
 string path = parts[1];
 
-string response = (path == "/")
-    ? "HTTP/1.1 200 OK\r\n\r\n"
-    : "HTTP/1.1 404 Not Found\r\n\r\n";
+string response;
+
+if (path == "/")
+{
+    response = "HTTP/1.1 200 OK\r\n\r\n";
+}
+else if (path.StartsWith("/echo/"))
+{
+    string body = path.Substring("/echo/".Length);
+    int length = Encoding.ASCII.GetByteCount(body); 
+    response =
+        "HTTP/1.1 200 OK\r\n" +
+        "Content-Type: text/plain\r\n" +
+        $"Content-Length: {length}\r\n" +
+        "\r\n" +
+        body;
+}
+else
+{
+    response = "HTTP/1.1 404 Not Found\r\n\r\n";
+}
 
 
 byte[] data = Encoding.ASCII.GetBytes(response);
