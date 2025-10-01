@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
 using System.IO;
+using System.IO.Compression;
 
 // --- --directory flag'ini al ---
 string? baseDir = null;
@@ -125,23 +126,65 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
             await WriteAsciiAsync(stream, "HTTP/1.1 200 OK\r\n\r\n");
             return;
         }
+        //else if (path.StartsWith("/echo/"))
+        //{
+          //  string body = path.Substring("/echo/".Length);
+           // int len = Encoding.ASCII.GetByteCount(body);
+            //string header =
+              //  "HTTP/1.1 200 OK\r\n" +
+               // "Content-Type: text/plain\r\n" +
+                //$"Content-Length: {len}\r\n" +
+                //"\r\n";
+            
+            //if (acceptEncoding?.Contains("gzip") == true)
+              //  header += "Content-Encoding: gzip\r\n";
+            
+          //  header += "\r\n";
+
+            //await WriteAsciiAsync(stream, header);
+            //await WriteAsciiAsync(stream, body);
+            //return;
+        //}
         else if (path.StartsWith("/echo/"))
         {
-            string body = path.Substring("/echo/".Length);
-            int len = Encoding.ASCII.GetByteCount(body);
-            string header =
-                "HTTP/1.1 200 OK\r\n" +
-                "Content-Type: text/plain\r\n" +
-                $"Content-Length: {len}\r\n";
-            
-            if (acceptEncoding?.Contains("gzip") == true)
-                header += "Content-Encoding: gzip\r\n";
-            
-            header += "\r\n";
+            string plainText = path.Substring("/echo/".Length);
 
-            await WriteAsciiAsync(stream, header);
-            await WriteAsciiAsync(stream, body);
-            return;
+            if (acceptEncoding?.Contains("gzip") == true)
+            {
+                // Gzip compression
+                byte[] inputBytes = Encoding.UTF8.GetBytes(plainText);
+                using var outputStream = new MemoryStream();
+                using (var gzip = new GZipStream(outputStream, CompressionLevel.SmallestSize, leaveOpen: true))
+                {
+                    gzip.Write(inputBytes, 0, inputBytes.Length);
+                }
+                byte[] compressed = outputStream.ToArray();
+
+                string header =
+                    "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: text/plain\r\n" +
+                    "Content-Encoding: gzip\r\n" +
+                    $"Content-Length: {compressed.Length}\r\n" +
+                    "\r\n";
+
+                await WriteAsciiAsync(stream, header);
+                await stream.WriteAsync(compressed, 0, compressed.Length);
+                return;
+            }
+            else
+            {
+                // Gzip desteklenmiyorsa düz metin
+                int len = Encoding.ASCII.GetByteCount(plainText);
+                string header =
+                    "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: text/plain\r\n" +
+                    $"Content-Length: {len}\r\n" +
+                    "\r\n";
+
+                await WriteAsciiAsync(stream, header);
+                await WriteAsciiAsync(stream, plainText);
+                return;
+            }
         }
         else if (path == "/user-agent")
         {
