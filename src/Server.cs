@@ -11,9 +11,8 @@ for (int i = 0; i < args.Length; i++)
     if (args[i] == "--directory" && i + 1 < args.Length)
         baseDir = args[i + 1];
 }
-
 string? baseDirFull = baseDir is null ? null : Path.GetFullPath(baseDir);
-    
+
 var server = new TcpListener(IPAddress.Any, 4221);
 server.Start();
 
@@ -29,17 +28,19 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
     using (tcpClient)
     using (var stream = tcpClient.GetStream())
     {
+        // --- headers ---
         string raw = await ReadUntilHeadersEndAsync(stream);
 
         int endOfRequestLine = raw.IndexOf("\r\n");
         int endOfHeaders     = raw.IndexOf("\r\n\r\n");
 
+        // --- request line ---
         string requestLine = endOfRequestLine >= 0 ? raw[..endOfRequestLine] : raw;
         string[] parts = requestLine.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+        string method = parts.Length >= 1 ? parts[0] : "GET";
+        string path   = parts.Length >= 2 ? parts[1] : "/";
 
-        string path = parts.Length >= 2 ? parts[1] : "/";
-
-        // --- headers ---
+        // --- headers section (string) ---
         string headersSection = "";
         if (endOfHeaders > endOfRequestLine + 2)
         {
@@ -49,19 +50,68 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
         }
 
         string? userAgent = null;
+        string? contentLengthRaw = null;
+        string? contentType = null;
+
         if (!string.IsNullOrEmpty(headersSection))
         {
             foreach (var line in headersSection.Split("\r\n"))
             {
                 int colon = line.IndexOf(':');
                 if (colon <= 0) continue;
+
                 string name  = line[..colon].Trim();
                 string value = line[(colon + 1)..].Trim();
+
                 if (name.Equals("User-Agent", StringComparison.OrdinalIgnoreCase))
-                {
                     userAgent = value;
-                    break;
+
+                if (name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+                    contentLengthRaw = value;
+
+                if (name.Equals("Content-Type", StringComparison.OrdinalIgnoreCase))
+                    contentType = value;
+            }
+        }
+
+        // --- body hazırla: header-sonrası pakette gelen ilk parça ---
+        string bodySoFarText = raw[(endOfHeaders + 4)..];                 // header'dan sonra gelen kısmın text hali
+        byte[] firstBytes    = Encoding.ASCII.GetBytes(bodySoFarText);    // bu stage'de ASCII yeterli
+        int?   contentLength = null;
+        if (contentLengthRaw != null && int.TryParse(contentLengthRaw, out var length))
+            contentLength = length;
+
+        byte[]? bodyBuffer = null; // tam body (byte[]) burada tutulacak
+
+        // Sadece body gereken durumlarda tamamlayacağız (örn. POST /files/..)
+        // Ama body uzunluğunu ve ilk parçayı şimdiden hazırlamak faydalı.
+        if (contentLength.HasValue && contentLength.Value >= 0)
+        {
+            int target = contentLength.Value;
+            if (target > 0)
+            {
+                bodyBuffer = new byte[target];
+
+                // İlk parça (ilk okuma paketinde header'dan sonra gelen baytlar)
+                int filled = Math.Min(firstBytes.Length, target);
+                if (filled > 0)
+                    Buffer.BlockCopy(firstBytes, 0, bodyBuffer, 0, filled);
+
+                // Kalanı stream'den oku
+                while (filled < target)
+                {
+                    int n = await stream.ReadAsync(bodyBuffer, filled, target - filled);
+                    if (n <= 0) break; // bağlantı kapandı/erken bitti -> protokol ihlali sayılabilir
+                    filled += n;
                 }
+
+                // Not: Eğer filled < target kaldıysa, body eksik geldi demektir.
+                // Bu stage'de basitçe devam edip eksikse de yazmamak tercih edebiliriz.
+            }
+            else
+            {
+                // Content-Length: 0 -> boş body
+                bodyBuffer = Array.Empty<byte>();
             }
         }
 
@@ -99,42 +149,68 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
         }
         else if (path.StartsWith("/files/") && baseDirFull != null)
         {
-            // --- /files/{filename} ---
             string fileName = path.Substring("/files/".Length); // {filename}
-
             if (string.IsNullOrEmpty(fileName))
             {
                 await WriteAsciiAsync(stream, "HTTP/1.1 404 Not Found\r\n\r\n");
                 return;
             }
 
+            // path traversal guard
             string fullPath = Path.GetFullPath(Path.Combine(baseDirFull, fileName));
             var baseNormalized = baseDirFull.TrimEnd(Path.DirectorySeparatorChar);
-            var baseWithSep   = baseNormalized + Path.DirectorySeparatorChar;
-
+            var baseWithSep    = baseNormalized + Path.DirectorySeparatorChar;
             if (!fullPath.StartsWith(baseWithSep, StringComparison.Ordinal))
             {
                 await WriteAsciiAsync(stream, "HTTP/1.1 404 Not Found\r\n\r\n");
                 return;
             }
 
-            if (!File.Exists(fullPath))
+            // --- Method bazlı ayrım: GET = oku, POST = yaz ---
+            if (method.Equals("GET", StringComparison.OrdinalIgnoreCase))
             {
-                await WriteAsciiAsync(stream, "HTTP/1.1 404 Not Found\r\n\r\n");
+                if (!File.Exists(fullPath))
+                {
+                    await WriteAsciiAsync(stream, "HTTP/1.1 404 Not Found\r\n\r\n");
+                    return;
+                }
+
+                byte[] fileBytes = await File.ReadAllBytesAsync(fullPath);
+                string header =
+                    "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: application/octet-stream\r\n" +
+                    $"Content-Length: {fileBytes.Length}\r\n" +
+                    "\r\n";
+                await WriteAsciiAsync(stream, header);
+                await stream.WriteAsync(fileBytes, 0, fileBytes.Length);
+                await stream.FlushAsync();
                 return;
             }
+            else if (method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                // Bu stage’de: body zorunlu, Content-Length zorunlu
+                if (contentLength is null || contentLength.Value < 0 || bodyBuffer is null)
+                {
+                    await WriteAsciiAsync(stream, "HTTP/1.1 400 Bad Request\r\n\r\n");
+                    return;
+                }
 
-            byte[] fileBytes = await File.ReadAllBytesAsync(fullPath);
-            string header =
-                "HTTP/1.1 200 OK\r\n" +
-                "Content-Type: application/octet-stream\r\n" +
-                $"Content-Length: {fileBytes.Length}\r\n" +
-                "\r\n";
+                // Dosyaya "ham" body yaz (text/binary fark etmez)
+                // Klasör yoksa (tester oluşturuyor ama gene de), güvenli olmak için:
+                Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
 
-            await WriteAsciiAsync(stream, header);
-            await stream.WriteAsync(fileBytes, 0, fileBytes.Length);
-            await stream.FlushAsync();
-            return;
+                await File.WriteAllBytesAsync(fullPath, bodyBuffer);
+
+                // Stage beklentisi: 201 Created, header/body zorunlu değil.
+                await WriteAsciiAsync(stream, "HTTP/1.1 201 Created\r\n\r\n");
+                return;
+            }
+            else
+            {
+                // Bu endpoint için sadece GET/POST destekliyoruz.
+                await WriteAsciiAsync(stream, "HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+                return;
+            }
         }
         else
         {
