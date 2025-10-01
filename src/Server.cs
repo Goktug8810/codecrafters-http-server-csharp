@@ -175,8 +175,7 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                         "HTTP/1.1 200 OK\r\n" +
                         "Content-Type: text/plain\r\n" +
                         "Content-Encoding: gzip\r\n" +
-                        $"Content-Length: {compressed.Length}\r\n" +
-                        "\r\n";
+                        $"Content-Length: {compressed.Length}\r\n";
                     
                     header += "\r\n";
                     
@@ -197,8 +196,7 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                     string header =
                         "HTTP/1.1 200 OK\r\n" +
                         "Content-Type: text/plain\r\n" +
-                        $"Content-Length: {len}\r\n" +
-                        "\r\n";
+                        $"Content-Length: {len}\r\n";
                     
                     if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
                         header += "Connection: close\r\n";
@@ -220,8 +218,7 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                 string header =
                     "HTTP/1.1 200 OK\r\n" +
                     "Content-Type: text/plain\r\n" +
-                    $"Content-Length: {len}\r\n" +
-                    "\r\n";
+                    $"Content-Length: {len}\r\n";
                 
                 header += "\r\n";
                 
@@ -275,8 +272,7 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                     string header =
                         "HTTP/1.1 200 OK\r\n" +
                         "Content-Type: application/octet-stream\r\n" +
-                        $"Content-Length: {fileBytes.Length}\r\n" +
-                        "\r\n";
+                        $"Content-Length: {fileBytes.Length}\r\n";
                     
                     if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
                         header += "Connection: close\r\n";
