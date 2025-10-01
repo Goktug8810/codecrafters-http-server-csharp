@@ -131,7 +131,10 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
             if (path == "/")
             {
                 await WriteAsciiAsync(stream, "HTTP/1.1 200 OK\r\n\r\n");
-                continue;
+                if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                    break;
+                else
+                    continue;
             }
             //else if (path.StartsWith("/echo/"))
             //{
@@ -176,7 +179,10 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
 
                     await WriteAsciiAsync(stream, header);
                     await stream.WriteAsync(compressed, 0, compressed.Length);
-                    continue;
+                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                        break;
+                    else
+                        continue;;
                 }
                 else
                 {
@@ -190,7 +196,10 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
 
                     await WriteAsciiAsync(stream, header);
                     await WriteAsciiAsync(stream, plainText);
-                    continue;
+                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                        break;
+                    else
+                        continue;;
                 }
             }
             else if (path == "/user-agent")
@@ -204,7 +213,10 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                     "\r\n";
                 await WriteAsciiAsync(stream, header);
                 await WriteAsciiAsync(stream, body);
-                continue;
+                if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                    break;
+                else
+                    continue;;
             }
             else if (path.StartsWith("/files/") && baseDirFull != null)
             {
@@ -212,7 +224,10 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                 if (string.IsNullOrEmpty(fileName))
                 {
                     await WriteAsciiAsync(stream, "HTTP/1.1 404 Not Found\r\n\r\n");
-                    continue;
+                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                        break;
+                    else
+                        continue;;
                 }
 
                 // path traversal guard
@@ -222,7 +237,10 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                 if (!fullPath.StartsWith(baseWithSep, StringComparison.Ordinal))
                 {
                     await WriteAsciiAsync(stream, "HTTP/1.1 404 Not Found\r\n\r\n");
-                    continue;
+                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                        break;
+                    else
+                        continue;;
                 }
 
                 // --- Method bazlı ayrım: GET = oku, POST = yaz ---
@@ -231,7 +249,10 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                     if (!File.Exists(fullPath))
                     {
                         await WriteAsciiAsync(stream, "HTTP/1.1 404 Not Found\r\n\r\n");
-                        continue;
+                        if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                            break;
+                        else
+                            continue;;
                     }
 
                     byte[] fileBytes = await File.ReadAllBytesAsync(fullPath);
@@ -243,7 +264,10 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                     await WriteAsciiAsync(stream, header);
                     await stream.WriteAsync(fileBytes, 0, fileBytes.Length);
                     await stream.FlushAsync();
-                    continue;
+                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                        break;
+                    else
+                        continue;;
                 }
                 else if (method.Equals("POST", StringComparison.OrdinalIgnoreCase))
                 {
@@ -251,7 +275,10 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                     if (contentLength is null || contentLength.Value < 0 || bodyBuffer is null)
                     {
                         await WriteAsciiAsync(stream, "HTTP/1.1 400 Bad Request\r\n\r\n");
-                        continue;
+                        if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                            break;
+                        else
+                            continue;;
                     }
 
                     // Dosyaya "ham" body yaz (text/binary fark etmez)
@@ -262,23 +289,30 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
 
                     // Stage beklentisi: 201 Created, header/body zorunlu değil.
                     await WriteAsciiAsync(stream, "HTTP/1.1 201 Created\r\n\r\n");
-                    continue;
+                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                        break;
+                    else
+                        continue;
                 }
                 else
                 {
                     // Bu endpoint için sadece GET/POST destekliyoruz.
                     await WriteAsciiAsync(stream, "HTTP/1.1 405 Method Not Allowed\r\n\r\n");
-                    continue;
+                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                        break;
+                    else
+                        continue;
                 }
             }
             else
             {
                 await WriteAsciiAsync(stream, "HTTP/1.1 404 Not Found\r\n\r\n");
-                continue;
+                if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                    break;
+                else
+                    continue;
             }
             
-            if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                break; // bağlantıyı kapat
         }
         
     }
