@@ -131,6 +131,7 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
             if (path == "/")
             {
                 await WriteAsciiAsync(stream, "HTTP/1.1 200 OK\r\n\r\n");
+                
                 if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
                     break;
                 else
@@ -177,6 +178,8 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                         $"Content-Length: {compressed.Length}\r\n" +
                         "\r\n";
                     
+                    header += "\r\n";
+                    
                     if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
                         header += "Connection: close\r\n";
                     
@@ -199,6 +202,8 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                     
                     if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
                         header += "Connection: close\r\n";
+                    
+                        header += "\r\n";
 
                     await WriteAsciiAsync(stream, header);
                     await WriteAsciiAsync(stream, plainText);
@@ -217,6 +222,8 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                     "Content-Type: text/plain\r\n" +
                     $"Content-Length: {len}\r\n" +
                     "\r\n";
+                
+                header += "\r\n";
                 
                 if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
                     header += "Connection: close\r\n";
@@ -274,6 +281,7 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                     if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
                         header += "Connection: close\r\n";
                     
+                    header += "\r\n";
                     await WriteAsciiAsync(stream, header);
                     await stream.WriteAsync(fileBytes, 0, fileBytes.Length);
                     await stream.FlushAsync();
