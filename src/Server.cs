@@ -1,11 +1,16 @@
+using System;
+using System.Buffers;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
-using System.IO;
-using System.IO.Compression;
 
-// --- --directory flag'ini al ---
+// -----------------------------
+// Boot
+// -----------------------------
 string? baseDir = null;
 for (int i = 0; i < args.Length; i++)
 {
@@ -19,338 +24,420 @@ server.Start();
 
 while (true)
 {
-    TcpClient tcpClient = await server.AcceptTcpClientAsync(); // non-blocking accept
-    tcpClient.NoDelay = true; // küçük cevapları hemen yolla
-    _ = HandleClientAsync(tcpClient, baseDirFull); // her bağlantı ayrı async
+    var tcp = await server.AcceptTcpClientAsync().ConfigureAwait(false);
+    tcp.NoDelay = true;
+    _ = MiniHttpServer.HandleClientAsync(tcp, baseDirFull);
 }
 
-static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
+// -----------------------------
+// Core Server
+// -----------------------------
+static class MiniHttpServer
 {
-    using (tcpClient)
-    using (var stream = tcpClient.GetStream())
+    public static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
     {
-        // --- headers ---
-
-        while (true)
+        using (tcpClient)
+        using (var stream = tcpClient.GetStream())
         {
-            string raw = await ReadUntilHeadersEndAsync(stream);
+            var reader = new HttpReader(stream);
+            var writer = new HttpWriter(stream);
 
-            int endOfRequestLine = raw.IndexOf("\r\n");
-            int endOfHeaders     = raw.IndexOf("\r\n\r\n");
-
-            // --- request line ---
-            string requestLine = endOfRequestLine >= 0 ? raw[..endOfRequestLine] : raw;
-            string[] parts = requestLine.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
-            string method = parts.Length >= 1 ? parts[0] : "GET";
-            string path   = parts.Length >= 2 ? parts[1] : "/";
-
-            // --- headers section (string) ---
-            string headersSection = "";
-            if (endOfHeaders > endOfRequestLine + 2)
+            while (true)
             {
-                headersSection = raw.Substring(
-                    endOfRequestLine + 2,
-                    endOfHeaders - (endOfRequestLine + 2));
+                // 1) Read & parse request
+                var read = await reader.ReadRequestAsync().ConfigureAwait(false);
+                if (read is null) break; // client closed
+
+                HttpRequest req = read.Value.Request;
+                byte[] body = read.Value.Body ?? Array.Empty<byte>();
+
+                // 2) Route
+                HttpResponse res = Router.Route(req, body, baseDirFull);
+
+                // 3) Write response
+                await writer.WriteAsync(res).ConfigureAwait(false);
+
+                // 4) Connection lifetime
+                if (req.ConnectionClose)
+                    break;
             }
+        }
+    }
+}
 
-            string? userAgent = null;
-            string? contentLengthRaw = null;
-            string? contentType = null;
-            string? acceptEncoding = null;
-            string? connectionHeader = null;
+// -----------------------------
+// HTTP Types
+// -----------------------------
+readonly struct HttpRequest
+{
+    public readonly string Method;
+    public readonly string Path;
+    public readonly string Version;
+    public readonly HeaderBag Headers;
+    public readonly int? ContentLength;
+    public readonly string? UserAgent;
+    public readonly string? AcceptEncoding;
+    public readonly bool ConnectionClose;
 
-            if (!string.IsNullOrEmpty(headersSection))
+    public HttpRequest(
+        string method, string path, string version, HeaderBag headers)
+    {
+        Method = method;
+        Path = path;
+        Version = version;
+        Headers = headers;
+
+        if (headers.TryGet("Content-Length", out var cl) && int.TryParse(cl, out var len))
+            ContentLength = len;
+        else
+            ContentLength = null;
+
+        UserAgent = headers.TryGet("User-Agent", out var ua) ? ua : null;
+        AcceptEncoding = headers.TryGet("Accept-Encoding", out var ae) ? ae : null;
+
+        var conn = headers.TryGet("Connection", out var ch) ? ch : null;
+        ConnectionClose = conn != null && conn.Equals("close", StringComparison.OrdinalIgnoreCase);
+    }
+}
+
+sealed class HttpResponse
+{
+    public int StatusCode { get; set; } = 200;
+    public string ReasonPhrase { get; set; } = "OK";
+    public string ContentType { get; set; } = "text/plain";
+    public Dictionary<string,string> Headers { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public byte[] Body { get; set; } = Array.Empty<byte>();
+
+    public void SetHeader(string name, string value) => Headers[name] = value;
+}
+
+sealed class HeaderBag
+{
+    private readonly Dictionary<string, string> _map = new(StringComparer.OrdinalIgnoreCase);
+
+    public void Add(string name, string value)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return;
+        _map[name.Trim()] = value?.Trim() ?? string.Empty;
+    }
+
+    public bool TryGet(string name, out string value) => _map.TryGetValue(name, out value!);
+}
+
+// -----------------------------
+// Reader / Writer
+// -----------------------------
+sealed class HttpReader
+{
+    private readonly NetworkStream _stream;
+    public HttpReader(NetworkStream stream) => _stream = stream;
+
+    private static readonly byte[] CRLFCRLF = Encoding.ASCII.GetBytes("\r\n\r\n");
+
+    public async Task<(HttpRequest Request, byte[]? Body)?> ReadRequestAsync()
+    {
+        // Read until CRLFCRLF; keep leftover for body
+        var headerBuffer = new MemoryStream();
+        var readBuffer = ArrayPool<byte>.Shared.Rent(2048);
+        try
+        {
+            int headerEndAt = -1;
+            byte[]? firstBodyChunk = null;
+
+            while (true)
             {
-                foreach (var line in headersSection.Split("\r\n"))
+                int n = await _stream.ReadAsync(readBuffer, 0, readBuffer.Length).ConfigureAwait(false);
+                if (n <= 0)
                 {
-                    int colon = line.IndexOf(':');
-                    if (colon <= 0) continue;
+                    if (headerBuffer.Length == 0) return null; // client closed before any data
+                    break;
+                }
 
-                    string name  = line[..colon].Trim();
-                    string value = line[(colon + 1)..].Trim();
+                headerBuffer.Write(readBuffer, 0, n);
 
-                    if (name.Equals("User-Agent", StringComparison.OrdinalIgnoreCase))
-                        userAgent = value;
-
-                    if (name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
-                        contentLengthRaw = value;
-
-                    if (name.Equals("Content-Type", StringComparison.OrdinalIgnoreCase))
-                        contentType = value;
-                    
-                    if (name.Equals("Accept-Encoding", StringComparison.OrdinalIgnoreCase))
-                        acceptEncoding = value;
-                    
-                    if (name.Equals("Connection", StringComparison.OrdinalIgnoreCase))
-                        connectionHeader = value;
+                // Search for CRLFCRLF
+                var span = new ReadOnlySpan<byte>(headerBuffer.GetBuffer(), 0, (int)headerBuffer.Length);
+                int idx = IndexOf(span, CRLFCRLF);
+                if (idx >= 0)
+                {
+                    headerEndAt = idx + CRLFCRLF.Length;
+                    int leftover = span.Length - headerEndAt;
+                    if (leftover > 0)
+                    {
+                        firstBodyChunk = new byte[leftover];
+                        Array.Copy(headerBuffer.GetBuffer(), headerEndAt, firstBodyChunk, 0, leftover);
+                    }
+                    break;
                 }
             }
 
-            // --- body hazırla: header-sonrası pakette gelen ilk parça ---
-            string bodySoFarText = raw[(endOfHeaders + 4)..];                 // header'dan sonra gelen kısmın text hali
-            byte[] firstBytes    = Encoding.ASCII.GetBytes(bodySoFarText);    // bu stage'de ASCII yeterli
-            int?   contentLength = null;
-            if (contentLengthRaw != null && int.TryParse(contentLengthRaw, out var length))
-                contentLength = length;
+            if (headerEndAt < 0)
+                return null; // malformed or closed
 
-            byte[]? bodyBuffer = null; // tam body (byte[]) burada tutulacak
+            // Parse request line + headers (ASCII)
+            var headerBytes = headerBuffer.GetBuffer();
+            string headerText = Encoding.ASCII.GetString(headerBytes, 0, headerEndAt);
+            var (request, contentLength) = ParseHeaders(headerText);
 
-            // Sadece body gereken durumlarda tamamlayacağız (örn. POST /files/..)
-            // Ama body uzunluğunu ve ilk parçayı şimdiden hazırlamak faydalı.
+            // Read body if Content-Length present
+            byte[]? body = null;
             if (contentLength.HasValue && contentLength.Value >= 0)
             {
                 int target = contentLength.Value;
-                if (target > 0)
+                body = new byte[target];
+                int filled = 0;
+
+                if (firstBodyChunk is not null && firstBodyChunk.Length > 0)
                 {
-                    bodyBuffer = new byte[target];
+                    int toCopy = Math.Min(firstBodyChunk.Length, target);
+                    Buffer.BlockCopy(firstBodyChunk, 0, body, 0, toCopy);
+                    filled += toCopy;
+                }
 
-                    // İlk parça (ilk okuma paketinde header'dan sonra gelen baytlar)
-                    int filled = Math.Min(firstBytes.Length, target);
-                    if (filled > 0)
-                        Buffer.BlockCopy(firstBytes, 0, bodyBuffer, 0, filled);
+                while (filled < target)
+                {
+                    int n = await _stream.ReadAsync(body, filled, target - filled).ConfigureAwait(false);
+                    if (n <= 0) break; // premature close
+                    filled += n;
+                }
 
-                    // Kalanı stream'den oku
-                    while (filled < target)
+                if (filled < target)
+                {
+                    // Body incomplete -> we still return what we have (aligning with original minimal server behavior)
+                    if (filled == 0) body = Array.Empty<byte>();
+                    else if (filled < target)
                     {
-                        int n = await stream.ReadAsync(bodyBuffer, filled, target - filled);
-                        if (n <= 0) break; // bağlantı kapandı/erken bitti -> protokol ihlali sayılabilir
-                        filled += n;
+                        var shrunk = new byte[filled];
+                        Buffer.BlockCopy(body, 0, shrunk, 0, filled);
+                        body = shrunk;
                     }
-
-                    // Not: Eğer filled < target kaldıysa, body eksik geldi demektir.
-                    // Bu stage'de basitçe devam edip eksikse de yazmamak tercih edebiliriz.
-                }
-                else
-                {
-                    // Content-Length: 0 -> boş body
-                    bodyBuffer = Array.Empty<byte>();
                 }
             }
 
-            // --- routing ---
-            if (path == "/")
-            {
-                await WriteAsciiAsync(stream, "HTTP/1.1 200 OK\r\n\r\n");
-                
-                if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                    break;
-                else
-                    continue;
-            }
-            //else if (path.StartsWith("/echo/"))
-            //{
-              //  string body = path.Substring("/echo/".Length);
-               // int len = Encoding.ASCII.GetByteCount(body);
-                //string header =
-                  //  "HTTP/1.1 200 OK\r\n" +
-                   // "Content-Type: text/plain\r\n" +
-                    //$"Content-Length: {len}\r\n" +
-                    //"\r\n";
-                
-                //if (acceptEncoding?.Contains("gzip") == true)
-                  //  header += "Content-Encoding: gzip\r\n";
-                
-              //  header += "\r\n";
-
-                //await WriteAsciiAsync(stream, header);
-                //await WriteAsciiAsync(stream, body);
-                //return;
-            //}
-            else if (path.StartsWith("/echo/"))
-            {
-                string plainText = path.Substring("/echo/".Length);
-
-                if (acceptEncoding?.Contains("gzip") == true)
-                {
-                    // Gzip compression
-                    byte[] inputBytes = Encoding.UTF8.GetBytes(plainText);
-                    using var outputStream = new MemoryStream();
-                    using (var gzip = new GZipStream(outputStream, CompressionLevel.SmallestSize, leaveOpen: true))
-                    {
-                        gzip.Write(inputBytes, 0, inputBytes.Length);
-                    }
-                    byte[] compressed = outputStream.ToArray();
-
-                    string header =
-                        "HTTP/1.1 200 OK\r\n" +
-                        "Content-Type: text/plain\r\n" +
-                        "Content-Encoding: gzip\r\n" +
-                        $"Content-Length: {compressed.Length}\r\n";
-                    
-                    header += "\r\n";
-                    
-                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                        header += "Connection: close\r\n";
-                    
-                    await WriteAsciiAsync(stream, header);
-                    await stream.WriteAsync(compressed, 0, compressed.Length);
-                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                        break;
-                    else
-                        continue;;
-                }
-                else
-                {
-                    // Gzip desteklenmiyorsa düz metin
-                    int len = Encoding.ASCII.GetByteCount(plainText);
-                    string header =
-                        "HTTP/1.1 200 OK\r\n" +
-                        "Content-Type: text/plain\r\n" +
-                        $"Content-Length: {len}\r\n";
-                    
-                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                        header += "Connection: close\r\n";
-                    
-                        header += "\r\n";
-
-                    await WriteAsciiAsync(stream, header);
-                    await WriteAsciiAsync(stream, plainText);
-                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                        break;
-                    else
-                        continue;;
-                }
-            }
-            else if (path == "/user-agent")
-            {
-                string body = userAgent ?? "";
-                int len = Encoding.ASCII.GetByteCount(body);
-                string header =
-                    "HTTP/1.1 200 OK\r\n" +
-                    "Content-Type: text/plain\r\n" +
-                    $"Content-Length: {len}\r\n";
-                
-                header += "\r\n";
-                
-                if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                    header += "Connection: close\r\n";
-                await WriteAsciiAsync(stream, header);
-                await WriteAsciiAsync(stream, body);
-                if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                    break;
-                else
-                    continue;;
-            }
-            else if (path.StartsWith("/files/") && baseDirFull != null)
-            {
-                string fileName = path.Substring("/files/".Length); // {filename}
-                if (string.IsNullOrEmpty(fileName))
-                {
-                    await WriteAsciiAsync(stream, "HTTP/1.1 404 Not Found\r\n\r\n");
-                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                        break;
-                    else
-                        continue;;
-                }
-
-                // path traversal guard
-                string fullPath = Path.GetFullPath(Path.Combine(baseDirFull, fileName));
-                var baseNormalized = baseDirFull.TrimEnd(Path.DirectorySeparatorChar);
-                var baseWithSep    = baseNormalized + Path.DirectorySeparatorChar;
-                if (!fullPath.StartsWith(baseWithSep, StringComparison.Ordinal))
-                {
-                    await WriteAsciiAsync(stream, "HTTP/1.1 404 Not Found\r\n\r\n");
-                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                        break;
-                    else
-                        continue;;
-                }
-
-                // --- Method bazlı ayrım: GET = oku, POST = yaz ---
-                if (method.Equals("GET", StringComparison.OrdinalIgnoreCase))
-                {
-                    if (!File.Exists(fullPath))
-                    {
-                        await WriteAsciiAsync(stream, "HTTP/1.1 404 Not Found\r\n\r\n");
-                        if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                            break;
-                        else
-                            continue;;
-                    }
-
-                    byte[] fileBytes = await File.ReadAllBytesAsync(fullPath);
-                    string header =
-                        "HTTP/1.1 200 OK\r\n" +
-                        "Content-Type: application/octet-stream\r\n" +
-                        $"Content-Length: {fileBytes.Length}\r\n";
-                    
-                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                        header += "Connection: close\r\n";
-                    
-                    header += "\r\n";
-                    await WriteAsciiAsync(stream, header);
-                    await stream.WriteAsync(fileBytes, 0, fileBytes.Length);
-                    await stream.FlushAsync();
-                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                        break;
-                    else
-                        continue;;
-                }
-                else if (method.Equals("POST", StringComparison.OrdinalIgnoreCase))
-                {
-                    // Bu stage’de: body zorunlu, Content-Length zorunlu
-                    if (contentLength is null || contentLength.Value < 0 || bodyBuffer is null)
-                    {
-                        await WriteAsciiAsync(stream, "HTTP/1.1 400 Bad Request\r\n\r\n");
-                        if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                            break;
-                        else
-                            continue;;
-                    }
-
-                    // Dosyaya "ham" body yaz (text/binary fark etmez)
-                    // Klasör yoksa (tester oluşturuyor ama gene de), güvenli olmak için:
-                    Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-
-                    await File.WriteAllBytesAsync(fullPath, bodyBuffer);
-
-                    // Stage beklentisi: 201 Created, header/body zorunlu değil.
-                    await WriteAsciiAsync(stream, "HTTP/1.1 201 Created\r\n\r\n");
-                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                        break;
-                    else
-                        continue;
-                }
-                else
-                {
-                    // Bu endpoint için sadece GET/POST destekliyoruz.
-                    await WriteAsciiAsync(stream, "HTTP/1.1 405 Method Not Allowed\r\n\r\n");
-                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                        break;
-                    else
-                        continue;
-                }
-            }
-            else
-            {
-                await WriteAsciiAsync(stream, "HTTP/1.1 404 Not Found\r\n\r\n");
-                if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
-                    break;
-                else
-                    continue;
-            }
-            
+            return (request, body);
         }
-        
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(readBuffer);
+        }
     }
-}
 
-static async Task<string> ReadUntilHeadersEndAsync(NetworkStream stream)
-{
-    var sb = new StringBuilder();
-    var buffer = new byte[1024];
-    while (true)
+    private static (HttpRequest Request, int? ContentLength) ParseHeaders(string headersText)
     {
-        int n = await stream.ReadAsync(buffer, 0, buffer.Length);
-        if (n <= 0) break; // bağlantı kapandı
-        sb.Append(Encoding.ASCII.GetString(buffer, 0, n));
-        if (sb.ToString().Contains("\r\n\r\n")) break;
+        // request line
+        int firstCrlf = headersText.IndexOf("\r\n", StringComparison.Ordinal);
+        string reqLine = firstCrlf >= 0 ? headersText[..firstCrlf] : headersText;
+
+        var parts = reqLine.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+        string method = parts.Length > 0 ? parts[0] : "GET";
+        string path   = parts.Length > 1 ? parts[1] : "/";
+        string ver    = parts.Length > 2 ? parts[2] : "HTTP/1.1";
+
+        var bag = new HeaderBag();
+        if (firstCrlf >= 0 && firstCrlf + 2 < headersText.Length)
+        {
+            string lines = headersText.Substring(firstCrlf + 2);
+            int endOfHeaderBlock = lines.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+            if (endOfHeaderBlock >= 0) lines = lines[..endOfHeaderBlock];
+
+            foreach (var line in lines.Split("\r\n"))
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                int colon = line.IndexOf(':');
+                if (colon <= 0) continue;
+                string name = line[..colon].Trim();
+                string value = line[(colon + 1)..].Trim();
+                bag.Add(name, value);
+            }
+        }
+
+        var req = new HttpRequest(method, path, ver, bag);
+        return (req, req.ContentLength);
     }
-    return sb.ToString();
+
+    private static int IndexOf(ReadOnlySpan<byte> haystack, ReadOnlySpan<byte> needle)
+    {
+        if (needle.Length == 0) return 0;
+        for (int i = 0; i <= haystack.Length - needle.Length; i++)
+        {
+            if (haystack[i] == needle[0] && haystack.Slice(i, needle.Length).SequenceEqual(needle))
+                return i;
+        }
+        return -1;
+    }
 }
 
-static Task WriteAsciiAsync(NetworkStream stream, string s)
+sealed class HttpWriter
 {
-    byte[] bytes = Encoding.ASCII.GetBytes(s);
-    return stream.WriteAsync(bytes, 0, bytes.Length);
+    private readonly NetworkStream _stream;
+    public HttpWriter(NetworkStream stream) => _stream = stream;
+
+    public async Task WriteAsync(HttpResponse res)
+    {
+        // Status line
+        var sb = new StringBuilder();
+        sb.Append("HTTP/1.1 ").Append(res.StatusCode).Append(' ').Append(res.ReasonPhrase).Append("\r\n");
+
+        // Standard headers
+        if (!res.Headers.ContainsKey("Content-Type"))
+            sb.Append("Content-Type: ").Append(res.ContentType).Append("\r\n");
+
+        sb.Append("Content-Length: ").Append(res.Body?.Length ?? 0).Append("\r\n");
+
+        // Custom headers
+        foreach (var kv in res.Headers)
+        {
+            if (kv.Key.Equals("Content-Type", StringComparison.OrdinalIgnoreCase)) continue; // already wrote
+            if (kv.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase)) continue; // already wrote
+            sb.Append(kv.Key).Append(": ").Append(kv.Value).Append("\r\n");
+        }
+
+        // End of headers
+        sb.Append("\r\n");
+
+        // Write headers + body
+        var headerBytes = Encoding.ASCII.GetBytes(sb.ToString());
+        await _stream.WriteAsync(headerBytes, 0, headerBytes.Length).ConfigureAwait(false);
+
+        if (res.Body is { Length: > 0 })
+            await _stream.WriteAsync(res.Body, 0, res.Body.Length).ConfigureAwait(false);
+
+        await _stream.FlushAsync().ConfigureAwait(false);
+    }
+}
+
+// -----------------------------
+// Router & Handlers
+// -----------------------------
+static class Router
+{
+    public static HttpResponse Route(HttpRequest req, byte[] body, string? baseDirFull)
+    {
+        // "/" -> 200, empty body
+        if (req.Path == "/")
+            return Responses.OkEmpty(req);
+
+        // "/echo/{text}"
+        if (req.Path.StartsWith("/echo/", StringComparison.Ordinal))
+            return EchoHandler.Handle(req);
+
+        // "/user-agent"
+        if (req.Path == "/user-agent")
+            return UserAgentHandler.Handle(req);
+
+        // "/files/{filename}" (GET/POST), only when base dir provided
+        if (req.Path.StartsWith("/files/", StringComparison.Ordinal) && baseDirFull != null)
+            return FilesHandler.Handle(req, body, baseDirFull);
+
+        return Responses.NotFound(req);
+    }
+}
+
+static class EchoHandler
+{
+    public static HttpResponse Handle(HttpRequest req)
+    {
+        string text = req.Path.Substring("/echo/".Length);
+        // Encode as UTF8 for body; tests typically use ASCII-safe text
+        var plain = Encoding.UTF8.GetBytes(text);
+
+        // Gzip?
+        bool wantsGzip = req.AcceptEncoding?.Contains("gzip", StringComparison.OrdinalIgnoreCase) == true;
+        if (wantsGzip)
+        {
+            using var ms = new MemoryStream();
+            using (var gz = new GZipStream(ms, CompressionLevel.SmallestSize, leaveOpen: true))
+            {
+                gz.Write(plain, 0, plain.Length);
+            }
+            var compressed = ms.ToArray();
+
+            var res = Responses.OkBinary("text/plain", compressed);
+            res.SetHeader("Content-Encoding", "gzip");
+            if (req.ConnectionClose) res.SetHeader("Connection", "close");
+            return res;
+        }
+        else
+        {
+            var res = Responses.OkBinary("text/plain", plain);
+            if (req.ConnectionClose) res.SetHeader("Connection", "close");
+            return res;
+        }
+    }
+}
+
+static class UserAgentHandler
+{
+    public static HttpResponse Handle(HttpRequest req)
+    {
+        var body = Encoding.ASCII.GetBytes(req.UserAgent ?? "");
+        var res = Responses.OkBinary("text/plain", body);
+        if (req.ConnectionClose) res.SetHeader("Connection", "close");
+        return res;
+    }
+}
+
+static class FilesHandler
+{
+    public static HttpResponse Handle(HttpRequest req, byte[] rawBody, string baseDirFull)
+    {
+        string fileName = req.Path.Substring("/files/".Length);
+        if (string.IsNullOrEmpty(fileName))
+            return Responses.NotFound(req);
+
+        string baseNorm = baseDirFull.TrimEnd(Path.DirectorySeparatorChar);
+        string baseWithSep = baseNorm + Path.DirectorySeparatorChar;
+
+        string fullPath = Path.GetFullPath(Path.Combine(baseDirFull, fileName));
+
+        // path traversal guard
+        if (!fullPath.StartsWith(baseWithSep, StringComparison.Ordinal))
+            return Responses.NotFound(req);
+
+        if (req.Method.Equals("GET", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!File.Exists(fullPath))
+                return Responses.NotFound(req);
+
+            byte[] fileBytes = File.ReadAllBytes(fullPath);
+            var res = Responses.OkBinary("application/octet-stream", fileBytes);
+            if (req.ConnectionClose) res.SetHeader("Connection", "close");
+            return res;
+        }
+        else if (req.Method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+        {
+            // Content-Length must be present & body already read by reader
+            if (req.ContentLength is null || req.ContentLength.Value < 0)
+                return Responses.BadRequest(req);
+
+            Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+            File.WriteAllBytes(fullPath, rawBody);
+
+            var res = new HttpResponse { StatusCode = 201, ReasonPhrase = "Created", ContentType = "text/plain", Body = Array.Empty<byte>() };
+            if (req.ConnectionClose) res.SetHeader("Connection", "close");
+            return res;
+        }
+        else
+        {
+            return Responses.MethodNotAllowed(req);
+        }
+    }
+}
+
+static class Responses
+{
+    public static HttpResponse OkEmpty(HttpRequest req)
+        => new HttpResponse { StatusCode = 200, ReasonPhrase = "OK", ContentType = "text/plain", Body = Array.Empty<byte>() };
+
+    public static HttpResponse OkBinary(string contentType, byte[] body)
+        => new HttpResponse { StatusCode = 200, ReasonPhrase = "OK", ContentType = contentType, Body = body };
+
+    public static HttpResponse NotFound(HttpRequest req)
+        => new HttpResponse { StatusCode = 404, ReasonPhrase = "Not Found", ContentType = "text/plain", Body = Array.Empty<byte>() };
+
+    public static HttpResponse BadRequest(HttpRequest req)
+        => new HttpResponse { StatusCode = 400, ReasonPhrase = "Bad Request", ContentType = "text/plain", Body = Array.Empty<byte>() };
+
+    public static HttpResponse MethodNotAllowed(HttpRequest req)
+        => new HttpResponse { StatusCode = 405, ReasonPhrase = "Method Not Allowed", ContentType = "text/plain", Body = Array.Empty<byte>() };
 }
