@@ -176,7 +176,10 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                         "Content-Encoding: gzip\r\n" +
                         $"Content-Length: {compressed.Length}\r\n" +
                         "\r\n";
-
+                    
+                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                        header += "Connection: close\r\n";
+                    
                     await WriteAsciiAsync(stream, header);
                     await stream.WriteAsync(compressed, 0, compressed.Length);
                     if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
@@ -193,6 +196,9 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                         "Content-Type: text/plain\r\n" +
                         $"Content-Length: {len}\r\n" +
                         "\r\n";
+                    
+                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                        header += "Connection: close\r\n";
 
                     await WriteAsciiAsync(stream, header);
                     await WriteAsciiAsync(stream, plainText);
@@ -211,6 +217,9 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                     "Content-Type: text/plain\r\n" +
                     $"Content-Length: {len}\r\n" +
                     "\r\n";
+                
+                if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                    header += "Connection: close\r\n";
                 await WriteAsciiAsync(stream, header);
                 await WriteAsciiAsync(stream, body);
                 if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
@@ -261,6 +270,10 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
                         "Content-Type: application/octet-stream\r\n" +
                         $"Content-Length: {fileBytes.Length}\r\n" +
                         "\r\n";
+                    
+                    if (connectionHeader?.Equals("close", StringComparison.OrdinalIgnoreCase) == true)
+                        header += "Connection: close\r\n";
+                    
                     await WriteAsciiAsync(stream, header);
                     await stream.WriteAsync(fileBytes, 0, fileBytes.Length);
                     await stream.FlushAsync();
