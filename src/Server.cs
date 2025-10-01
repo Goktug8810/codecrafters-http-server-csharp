@@ -52,6 +52,7 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
         string? userAgent = null;
         string? contentLengthRaw = null;
         string? contentType = null;
+        string? acceptEncoding = null;
 
         if (!string.IsNullOrEmpty(headersSection))
         {
@@ -71,6 +72,9 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
 
                 if (name.Equals("Content-Type", StringComparison.OrdinalIgnoreCase))
                     contentType = value;
+                
+                if (name.Equals("Accept-Encoding", StringComparison.OrdinalIgnoreCase))
+                    acceptEncoding = value;
             }
         }
 
@@ -128,8 +132,13 @@ static async Task HandleClientAsync(TcpClient tcpClient, string? baseDirFull)
             string header =
                 "HTTP/1.1 200 OK\r\n" +
                 "Content-Type: text/plain\r\n" +
-                $"Content-Length: {len}\r\n" +
-                "\r\n";
+                $"Content-Length: {len}\r\n";
+            
+            if (acceptEncoding?.Contains("gzip") == true)
+                header += "Content-Encoding: gzip\r\n";
+            
+            header += "\r\n";
+
             await WriteAsciiAsync(stream, header);
             await WriteAsciiAsync(stream, body);
             return;
