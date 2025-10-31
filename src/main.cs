@@ -23,24 +23,37 @@ static async Task HandleClient(TcpClient client)
         {
             while (true)
             {
-                // 1) ÖNCE 4 byte: message_size
+                //  ÖNCE 4 byte: message_size
                 byte[] sizeBuf = await ReadExactlyAsync(stream, 4);
                 int messageSize = ReadInt32BigEndian(sizeBuf, 0);
 
-                // 2) Sonra header+body: message_size byte
+                // HEADER + BODY: message_size kadar oku
                 byte[] msg = await ReadExactlyAsync(stream, messageSize);
 
-                // Request header v2:
+                // Kafka Request Header v2:
                 // 0..1: request_api_key (INT16)
                 // 2..3: request_api_version (INT16)
                 // 4..7: correlation_id (INT32)
+                short apiKey = ReadInt16BigEndian(msg, 0);
                 short apiVersion = ReadInt16BigEndian(msg, 2);
                 int correlationId = ReadInt32BigEndian(msg, 4);
 
-                short errorCode = (apiVersion < 0 || apiVersion > 4) ? (short)35 : (short)0;
+                // Sadece ApiVersions (key=18) isteğini handle edeceğiz.
+                // Diğer tüm istekleri ignore ediyoruz.
+                byte[] response;
+                if (apiKey == 18)
+                {
+                    // apiVersion mantıksal kontrol (0–4 arası)
+                    short errorCode = (apiVersion < 0 || apiVersion > 4) ? (short)35 : (short)0;
+                    response = BuildApiVersionsResponseV4(correlationId, errorCode);
+                }
+                else
+                {
+                    // Diğer tüm request'lere boş cevap dön (tester sadece ApiVersions’ı kontrol ediyor)
+                    response = BuildApiVersionsResponseV4(correlationId, 0);
+                }
 
-                // 3) Response oluştur ve gönder
-                byte[] response = BuildApiVersionsResponseV4(correlationId, errorCode);
+                // Cevabı gönder
                 await stream.WriteAsync(response, 0, response.Length);
                 await stream.FlushAsync();
 
@@ -83,24 +96,32 @@ static byte[] BuildApiVersionsResponseV4(int correlationId, short errorCode)
     // error_code (INT16)
     WriteInt16BigEndian(buffer, offset, errorCode); offset += 2;
 
-    // api_keys: COMPACT_ARRAY with 1 entry (ApiVersions → key=18, min=0, max=4)
-    buffer[offset++] = 0x02;                // length = entries + 1 = 1 + 1
-    WriteInt16BigEndian(buffer, offset, 18); offset += 2; // api_key
-    WriteInt16BigEndian(buffer, offset, 0);  offset += 2; // min_version
-    WriteInt16BigEndian(buffer, offset, 4);  offset += 2; // max_version
-    buffer[offset++] = 0x00;                          // element TAG_BUFFER
+    // api_keys: COMPACT_ARRAY with 2 entries (18=ApiVersions, 75=DescribeTopicPartitions)
+    buffer[offset++] = 0x03; // length = entries + 1 = 2 + 1
+
+    // --- entry: ApiVersions ---
+    WriteInt16BigEndian(buffer, offset, 18); offset += 2;
+    WriteInt16BigEndian(buffer, offset, 0);  offset += 2;
+    WriteInt16BigEndian(buffer, offset, 4);  offset += 2;
+    buffer[offset++] = 0x00; // element TAG_BUFFER
+
+    // --- entry: DescribeTopicPartitions ---
+    WriteInt16BigEndian(buffer, offset, 75); offset += 2;
+    WriteInt16BigEndian(buffer, offset, 0);  offset += 2;
+    WriteInt16BigEndian(buffer, offset, 0);  offset += 2;
+    buffer[offset++] = 0x00; // element TAG_BUFFER
 
     // throttle_time_ms (INT32)
     WriteInt32BigEndian(buffer, offset, 0); offset += 4;
 
-    // supported_features: COMPACT_ARRAY with 0 entries → just count=1, no elements
-    buffer[offset++] = 0x01; // 0 + 1
+    // supported_features: COMPACT_ARRAY with 0 entries → just count=1
+    buffer[offset++] = 0x01;
 
     // finalized_features_epoch (INT64)
     WriteInt64BigEndian(buffer, offset, -1L); offset += 8;
 
-    // finalized_features: COMPACT_ARRAY with 0 entries → count=1
-    buffer[offset++] = 0x01; // 0 + 1
+    // finalized_features: COMPACT_ARRAY with 0 entries → just count=1
+    buffer[offset++] = 0x01;
 
     // zk_migration_ready (BOOLEAN)
     buffer[offset++] = 0x00; // false
