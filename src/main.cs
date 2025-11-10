@@ -46,23 +46,24 @@ static async Task HandleClient(TcpClient client)
                 }
                 else if (apiKey == 75)
                 {
-                    string topicName = ParseDescribeTopicPartitionsRequest(msg);
-                    string propsPath = Environment.GetCommandLineArgs().Length > 1
-                        ? Environment.GetCommandLineArgs()[1]
-                        : "/tmp/server.properties";
-                    string logPath = MetadataParser.GetMetadataLogPath(propsPath);
-                    var (topicId, partitionId) = MetadataParser.ReadMetadataLog(logPath, topicName);
-                    Console.WriteLine($"Topic: {topicId}, Partition: {partitionId}");
                     
-                    if (topicId == Guid.Empty)
-                    {
-                        response = BuildDescribeTopicPartitionsResponseV0(correlationId, topicName); // hata cevabı
-                    }
-                    else
-                    {
-                        Console.WriteLine($"Topic: {topicId}, Partition: {partitionId}");
-                        response = BuildDescribeTopicPartitionsResponseV0_OK(correlationId, topicName, topicId, partitionId);
-                    }
+                    
+                        var (topicName, limit) = ParseDescribeTopicPartitionsRequest(msg);
+                        if (limit <= 0) limit = 2; // güvenli fallback
+
+                        string propsPath = Environment.GetCommandLineArgs().Length > 1
+                            ? Environment.GetCommandLineArgs()[1]
+                            : "/tmp/server.properties";
+
+                        string logPath = MetadataParser.GetMetadataLogPath(propsPath);
+                        var (topicId, partitionIds) = MetadataParser.ReadMetadataLog(logPath, topicName, limit);
+
+                        Console.WriteLine($"Topic: {topicId}, Partitions: [{string.Join(", ", partitionIds)}]");
+    
+                        response = (topicId == Guid.Empty)
+                            ? BuildDescribeTopicPartitionsResponseV0(correlationId, topicName)
+                            : BuildDescribeTopicPartitionsResponseV0_OK(correlationId, topicName, topicId, partitionIds);
+                    
                 }
                 else
                 {
@@ -107,7 +108,38 @@ static int ReadUnsignedVarInt(byte[] b, ref int o) {
     return value;
 }
 
-static string ParseDescribeTopicPartitionsRequest(byte[] msg)
+static (string topicName, int responsePartitionLimit) ParseDescribeTopicPartitionsRequest(byte[] msg)
+{
+    int offset = 0;
+
+    offset += 2; // api_key
+    offset += 2; // api_version
+    offset += 4; // correlation_id
+
+    short clientIdLen = ReadInt16BigEndian(msg, offset); offset += 2;
+    if (clientIdLen > 0) offset += clientIdLen;
+
+    _ = ReadUnsignedVarInt(msg, ref offset); // header tagged fields
+
+    int topicsLen = ReadUnsignedVarInt(msg, ref offset);
+    if (topicsLen <= 1) return ("", 0);
+
+    int nameLenPlus1 = ReadUnsignedVarInt(msg, ref offset);
+    int realLen = nameLenPlus1 - 1;
+    string topicName = Encoding.UTF8.GetString(msg, offset, realLen);
+    offset += realLen;
+
+    _ = ReadUnsignedVarInt(msg, ref offset); // topic tagged fields
+
+    // ResponsePartitionLimit alanını oku (int32)
+    int responsePartitionLimit = 0;
+    if (offset + 4 <= msg.Length)
+        responsePartitionLimit = ReadInt32BigEndian(msg, offset);
+
+    return (topicName, responsePartitionLimit);
+}
+
+static string ParseDescribeTopicPartitionsRequest_SinglePartitionVersion(byte[] msg)
 {
     int offset = 0;
 
@@ -144,46 +176,6 @@ static string ParseDescribeTopicPartitionsRequest(byte[] msg)
     _ = ReadUnsignedVarInt(msg, ref offset);
 
     // (Request'in kalan alanlarını okumaya gerek yok)
-    return topicName;
-}
-static string ParseDescribeTopicPartitionsRequestOLD(byte[] msg)
-{
-    int offset = 0;
-
-    // --- Header ---
-    offset += 2; // api_key
-    offset += 2; // api_version
-    offset += 4; // correlation_id
-
-    // --- Client ID (INT16 length + bytes)
-    if (offset + 2 > msg.Length) return "";
-    short clientIdLen = ReadInt16BigEndian(msg, offset);
-    offset += 2;
-    if (offset + clientIdLen > msg.Length) return "";
-    offset += clientIdLen;
-
-    // --- Topics array (INT32 length)
-    if (offset + 4 > msg.Length) return "";
-    short topicsLen = ReadInt16BigEndian(msg, offset);
-    offset += 2;
-    if (topicsLen <= 0) return "";
-
-
-    // --- Topic name (INT8 length + bytes)
-    if (offset + 1 > msg.Length) return "";
-    byte nameLen = msg[offset++];
-    if (offset + nameLen > msg.Length)
-        nameLen = (byte)(msg.Length - offset);
-
-    string topicName = Encoding.UTF8.GetString(msg, offset, nameLen);
-    offset += nameLen;
-    
-    // --- Partitions (INT32 length)
-    if (offset + 4 > msg.Length) return topicName;
-    int partitionsCount = ReadInt32BigEndian(msg, offset);
-    offset += 4 + (partitionsCount * 4);
-    if (offset > msg.Length) offset = msg.Length;
-
     return topicName;
 }
 
@@ -263,7 +255,11 @@ static byte[] BuildDescribeTopicPartitionsResponseV0(int correlationId, string t
     return result;
 }
 
-static byte[] BuildDescribeTopicPartitionsResponseV0_OK(int correlationId, string topicName, Guid topicId, int partitionId)
+static byte[] BuildDescribeTopicPartitionsResponseV0_OK(
+    int correlationId,
+    string topicName,
+    Guid topicId,
+    List<int> partitionIds)
 {
     var bytes = new List<byte>();
 
@@ -296,49 +292,54 @@ static byte[] BuildDescribeTopicPartitionsResponseV0_OK(int correlationId, strin
     WriteByte(0x00); // header tagged fields = none
 
     // ---- BODY ----
-    WriteInt32(0);   // throttle_time_ms
-    WriteUnsignedVarInt(2); // topics array length = (1 + 1)
+    WriteInt32(0); // throttle_time_ms
+    WriteUnsignedVarInt(2); // topics array length = (1 topic + 1)
 
     // --- Topic entry ---
-    WriteInt16(0); // ✅ ErrorCode = 0
+    WriteInt16(0); // error_code = 0
+
     byte[] nameBytes = Encoding.UTF8.GetBytes(topicName);
     WriteUnsignedVarInt(nameBytes.Length + 1); // compact string
     bytes.AddRange(nameBytes);
 
-    // UUID
+    // topic_id (UUID)
     byte[] uuidBytes = KafkaProtocolUtils.GuidToBytesBigEndian(topicId);
     bytes.AddRange(uuidBytes);
 
     WriteByte(0x00); // is_internal = false
 
     // --- Partitions array ---
-    WriteUnsignedVarInt(2); // (1 partition + 1)
-    WriteInt16(0);          // partition_error_code = 0
-    WriteInt32(partitionId);// partition_index
-    WriteInt32(0);          // leader_id
-    WriteInt32(0);          // leader_epoch
+    WriteUnsignedVarInt(partitionIds.Count + 1);
 
-    // replicas = [0]
-    WriteUnsignedVarInt(2); // (1 + 1)
-    WriteInt32(0);
+    foreach (var pid in partitionIds)
+    {
+        WriteInt16(0);      // partition_error_code = 0
+        WriteInt32(pid);    // partition_index
+        WriteInt32(0);      // leader_id
+        WriteInt32(0);      // leader_epoch
 
-    // isr = [0]
-    WriteUnsignedVarInt(2);
-    WriteInt32(0);
+        // replicas = [0]
+        WriteUnsignedVarInt(2);
+        WriteInt32(0);
 
-    // eligible_leader_replicas = [0]
-    WriteUnsignedVarInt(2);
-    WriteInt32(0);
+        // isr = [0]
+        WriteUnsignedVarInt(2);
+        WriteInt32(0);
 
-    // last_known_elr = [0]
-    WriteUnsignedVarInt(2);
-    WriteInt32(0);
+        // eligible_leader_replicas = [0]
+        WriteUnsignedVarInt(2);
+        WriteInt32(0);
 
-    // offline_replicas = []
-    WriteUnsignedVarInt(1);
+        // last_known_elr = [0]
+        WriteUnsignedVarInt(2);
+        WriteInt32(0);
 
-    // partition tagged fields = none
-    WriteUnsignedVarInt(0);
+        // offline_replicas = []
+        WriteUnsignedVarInt(1);
+
+        // partition tagged fields = none
+        WriteUnsignedVarInt(0);
+    }
 
     // topic_authorized_operations
     WriteInt32(33554432);
@@ -358,6 +359,7 @@ static byte[] BuildDescribeTopicPartitionsResponseV0_OK(int correlationId, strin
     var sizeBytes = BitConverter.GetBytes(messageSize);
     if (BitConverter.IsLittleEndian) Array.Reverse(sizeBytes);
     Array.Copy(sizeBytes, 0, result, 0, 4);
+
     return result;
 }
 
@@ -489,31 +491,22 @@ static class KafkaProtocolUtils
 static class MetadataParser
 {
     // topic adı alır, metadata log'dan uuid ve partition_id bulur
-    public static (Guid topicId, int partitionId) ReadMetadataLog(string filePath, string topicName)
+    public static (Guid topicId, List<int> partitionIds) ReadMetadataLog(string filePath, string topicName, int limit)
     {
         if (!File.Exists(filePath))
-            throw new FileNotFoundException($"Metadata log not found: {filePath}");
+            return (Guid.Empty, Enumerable.Range(0, limit).ToList());
 
         byte[] fileBytes = File.ReadAllBytes(filePath);
         byte[] nameBytes = Encoding.UTF8.GetBytes(topicName);
-
-        // Topic adını dosyada ara (string)
         int nameIndex = IndexOf(fileBytes, nameBytes);
         if (nameIndex == -1)
-        {
-            Console.WriteLine($"[WARN] Topic '{topicName}' not found in metadata log, returning error response.");
-            return (Guid.Empty, -1);
-        }
+            return (Guid.Empty, Enumerable.Range(0, limit).ToList());
 
-        // Adın civarındaki UUID'yi bul
         Guid topicId = FindUuidNear(fileBytes, nameIndex, topicName);
-
-        // UUID’ye göre partition_id bul
-        int partitionId = FindPartitionIdForUuid(fileBytes, topicId);
-
-        return (topicId, partitionId);
+        List<int> partitionIds = FindPartitionIdsForUuid(fileBytes, topicId, limit);
+        return (topicId, partitionIds);
     }
-
+    
     // Dosyada byte pattern arayan küçük yardımcı
     private static int IndexOf(byte[] haystack, byte[] needle)
     {
@@ -580,6 +573,130 @@ static class MetadataParser
         // tamamen sıfır olmayan, ama makul düzeyde boşluk içeren pattern
         return zeros < 14;
     }
+    
+    private static List<int> FindPartitionIdsForUuid(byte[] bytes, Guid topicId, int limit)
+    {
+        var ids = new List<int>();
+        byte[] uuidBytes = KafkaProtocolUtils.GuidToBytesBigEndian(topicId);
+
+        for (int i = 0; i <= bytes.Length - 20; i++)
+        {
+            bool match = true;
+            for (int j = 0; j < 16; j++)
+            {
+                if (bytes[i + j] != uuidBytes[j]) { match = false; break; }
+            }
+            if (!match) continue;
+
+            for (int lookahead = 16; lookahead < 128 && i + lookahead + 4 <= bytes.Length; lookahead++)
+            {
+                int candidate =
+                    (bytes[i + lookahead] << 24) |
+                    (bytes[i + lookahead + 1] << 16) |
+                    (bytes[i + lookahead + 2] << 8) |
+                    bytes[i + lookahead + 3];
+
+                if (candidate >= 0 && candidate < limit * 10) // makul filtre
+                    ids.Add(candidate);
+            }
+        }
+
+        ids = ids.Distinct().Where(x => x >= 0 && x < limit).OrderBy(x => x).ToList();
+
+        // fallback – eğer yeterli yoksa [0..limit-1]
+        if (ids.Count < limit)
+            ids = Enumerable.Range(0, limit).ToList();
+
+        Console.WriteLine($"[DEBUG] Final deterministic partition IDs for {topicId}: [{string.Join(", ", ids)}]");
+        return ids;
+    }
+    
+    private static List<int> FindPartitionIdsForUuid_Heuristik(byte[] bytes, Guid topicId)
+{
+    // Heuristik approach
+    var ids = new List<int>();
+    byte[] uuidBytes = KafkaProtocolUtils.GuidToBytesBigEndian(topicId);
+
+    int index = IndexOf(bytes, uuidBytes);
+    if (index == -1)
+    {
+        Console.WriteLine($"[DEBUG] UUID {topicId} not found in metadata log.");
+        return new List<int> { 0 }; // güvenli fallback
+    }
+
+    int scanStart = index + 16;
+    int scanEnd = Math.Min(bytes.Length - 4, scanStart + 256);
+
+    Console.WriteLine($"\n[DEBUG] Scanning for partitionIds near UUID={topicId} (offset={index})...");
+
+    int lastFoundPos = -9999;
+
+    for (int pos = scanStart; pos <= scanEnd - 4; pos++)
+    {
+        int candidate =
+            (bytes[pos] << 24) |
+            (bytes[pos + 1] << 16) |
+            (bytes[pos + 2] << 8) |
+            bytes[pos + 3];
+
+        // Sadece makul küçük int'leri düşün (partition id tipik olarak 0..100)
+        if (candidate < 0 || candidate > 100)
+            continue;
+
+        // ---- PEEK AHEAD: "1" büyük ihtimalle array length'tir ----
+        if (candidate == 1 && pos + 8 <= scanEnd)
+        {
+            int next =
+                (bytes[pos + 4] << 24) |
+                (bytes[pos + 5] << 16) |
+                (bytes[pos + 6] << 8) |
+                bytes[pos + 7];
+
+            // "1" hemen arkasından bir küçük int geliyorsa (örn. 0), bu 1 büyük ihtimalle SAYI (count)
+            if (next >= 0 && next <= 100)
+            {
+                Console.WriteLine($"[DEBUG] Skipping '1' at {pos} (likely partitions count), next candidate={next}.");
+                continue; // 1'i atla, döngü bir sonraki iterasyonda gerçek partition id'ye (next) gelecek
+            }
+        }
+
+        // ---- HEURISTIC: partition bloğu gibi mi görünüyor? ----
+        bool likelyPartition =
+            pos + 8 < bytes.Length &&
+            bytes[pos + 4] == 0x00 && bytes[pos + 5] == 0x00; // çoğunlukla leader_id ya da epoch sıfır
+
+        if (!likelyPartition)
+            continue;
+
+        // False positive azaltma: 0'dan hemen sonra 1 çok yakınsa (log interleave),
+        // 1'i görmezden gel (genelde count veya başka alan).
+        if (ids.Contains(0) && candidate == 1 && (pos - lastFoundPos) < 10)
+        {
+            Console.WriteLine($"[DEBUG] Ignoring nearby '1' after found 0 (likely false positive).");
+            continue;
+        }
+
+        if (!ids.Contains(candidate))
+        {
+            ids.Add(candidate);
+            lastFoundPos = pos;
+            Console.WriteLine($"[DEBUG] Found plausible partitionId={candidate} at offset={pos}");
+        }
+
+        // upper bound koruması (ileride 3–4 partition stage'lerinde de çalışır)
+        if (ids.Count >= 32) break;
+    }
+
+    if (ids.Count == 0)
+    {
+        Console.WriteLine("[DEBUG] No plausible partition IDs found. Defaulting to [0].");
+        ids.Add(0);
+    }
+
+    ids.Sort();
+    Console.WriteLine($"[DEBUG] Final partition IDs for {topicId}: [{string.Join(", ", ids)}]");
+    return ids;
+}
 
     // Aynı UUID tekrar geçtiğinde hemen sonrasındaki 4 byte partition_id
     private static int FindPartitionIdForUuid(byte[] bytes, Guid topicId)
