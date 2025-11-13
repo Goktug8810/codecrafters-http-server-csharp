@@ -384,7 +384,7 @@ static byte[] BuildApiVersionsResponseV4(int correlationId, short errorCode)
     Wi16(errorCode);
 
     // ---- API entries count (bizim homemade formatımızda 3 tane API var) ----
-    Wb(0x03);
+    Wb(0x04);
 
     // (1) ApiVersions (18)
     Wi16(18);  // ApiKey
@@ -404,14 +404,9 @@ static byte[] BuildApiVersionsResponseV4(int correlationId, short errorCode)
     Wi16(16);  // MaxVersion (>= 16 şartı)
     Wb(0x00);  // tagged fields
 
-    // Throttle & tagged fields 
-    Wi32(0);
-    Wb(0x01);
-    Wi64(-1L);
-    Wb(0x01);
-    Wb(0x00);
-    Wb(0x00);
-
+    Wi32(0);       // throttle_ms
+    Wb(0x00);      // response tagged fields = none
+    
     var res = bytes.ToArray();
     int size = res.Length - 4;
     var sz = BitConverter.GetBytes(size);
