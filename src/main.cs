@@ -124,7 +124,18 @@ static async Task HandleClient(TcpClient client)
                 }
                 else if (apiKey == 1)
                 {
-                    response = BuildFetchResponseV16(correlationId);
+                    Guid topicId = ParseFetchRequestTopicId(msg);
+
+                    if (topicId == Guid.Empty)
+                    {
+                        response = BuildFetchResponseNoTopicsV16(correlationId);
+                    }
+                    else
+                    {
+                        response = BuildFetchResponseUnknownTopicV16(correlationId, topicId);
+                    }
+                   // response = BuildFetchResponseUnknownTopicV16(correlationId, topicId);
+                   // response = BuildFetchResponseV16(correlationId);
                 }
                 else
                 {
@@ -185,6 +196,49 @@ static int ReadUnsignedVarInt(byte[] b, ref int o)
     return value;
 }
 
+static Guid ParseFetchRequestTopicId(byte[] msg)
+{
+    int o = 0;
+
+    // --- Header (v2) ---
+    o += 2; // apiKey
+    o += 2; // apiVersion
+    o += 4; // correlationId
+
+    short clientLen = ReadInt16BigEndian(msg, o); 
+    o += 2;
+    if (clientLen > 0)
+        o += clientLen;
+
+    // header tagged fields
+    _ = ReadUnsignedVarInt(msg, ref o);
+
+    // --- Body (v16) ---
+    // replica_id yok, bunu atlama
+    // o += 4;  // <-- SİL
+
+    o += 4; // max_wait_ms
+    o += 4; // min_bytes
+    o += 4; // max_bytes
+    o += 1; // isolation_level
+    o += 4; // session_id
+    o += 4; // session_epoch
+
+    int topicsLen = ReadUnsignedVarInt(msg, ref o);
+    int topicsCount = topicsLen - 1;
+
+    if (topicsCount == 0)
+        return Guid.Empty;
+
+    // --- UUID (BE) ---
+    byte[] be = new byte[16];
+    Buffer.BlockCopy(msg, o, be, 0, 16);
+    o += 16;
+
+    byte[] le = KafkaProtocolUtils.BytesBigEndianToGuid(be);
+    return new Guid(le);
+}
+
 static (List<string> topicNames, int responsePartitionLimit) 
     ParseDescribeTopicPartitionsRequest_Multi(byte[] msg)
 {
@@ -234,7 +288,70 @@ static (List<string> topicNames, int responsePartitionLimit)
 }
 // ---------- Response Builders ----------
 
-static byte[] BuildFetchResponseV16(int correlationId)
+static byte[] BuildFetchResponseUnknownTopicV16(int correlationId, Guid topicId)
+{
+    var bytes = new List<byte>();
+    void Wb(byte b) => bytes.Add(b);
+    void Wi16(short v) { var x = BitConverter.GetBytes(v); if (BitConverter.IsLittleEndian) Array.Reverse(x); bytes.AddRange(x); }
+    void Wi32(int v) { var x = BitConverter.GetBytes(v); if (BitConverter.IsLittleEndian) Array.Reverse(x); bytes.AddRange(x); }
+    void Wi64(long v) { var x = BitConverter.GetBytes(v); if (BitConverter.IsLittleEndian) Array.Reverse(x); bytes.AddRange(x); }
+
+    // placeholder for size
+    for (int i = 0; i < 4; i++) Wb(0);
+
+    // header
+    Wi32(correlationId);
+    Wb(0x00); // header tagged fields
+
+    // body
+    Wi32(0); // throttle_time_ms
+    Wi16(0); // error_code
+    Wi32(0); // session_id
+
+    // responses compact array → 1 item → encode as 2
+    Wb(0x02);
+
+    // --- Topic Response ---
+    // topic_id
+    bytes.AddRange(KafkaProtocolUtils.GuidToBytesBigEndian(topicId));
+
+    // partitions compact array → 1 item → encode as 2
+    Wb(0x02);
+
+    // --- Partition response ---
+    Wi32(0); // partition_index
+    Wi16(100); // UNKNOWN_TOPIC_ID
+    Wi64(0); // high_watermark
+    Wi64(0); // last_stable_offset
+    Wi64(0); // log_start_offset
+
+    // aborted transactions = empty compact array → 1
+    Wb(0x01);
+
+    Wi32(-1); // preferred_read_replica
+
+    // records → empty record batch → varint 0
+    Wb(0x00); 
+
+    // tagged fields
+    Wb(0x00);
+
+    // topic-level tagged fields
+    Wb(0x00);
+
+    // response-level tagged fields
+    Wb(0x00);
+
+    // finalize size
+    var res = bytes.ToArray();
+    int size = res.Length - 4;
+    byte[] sz = BitConverter.GetBytes(size);
+    if (BitConverter.IsLittleEndian) Array.Reverse(sz);
+    Array.Copy(sz, 0, res, 0, 4);
+    return res;
+}
+
+static byte[] BuildFetchResponseNoTopicsV16(int correlationId)
 {
     var bytes = new List<byte>();
     void Wb(byte b) => bytes.Add(b);
@@ -242,32 +359,31 @@ static byte[] BuildFetchResponseV16(int correlationId)
     void Wi32(int v) { var x = BitConverter.GetBytes(v); if (BitConverter.IsLittleEndian) Array.Reverse(x); bytes.AddRange(x); }
 
     // placeholder size
-    for (int i = 0; i < 4; i++) Wb(0x00);
+    for (int i = 0; i < 4; i++) Wb(0);
 
     // header
     Wi32(correlationId);
-    Wb(0x00); // header tagged fields
-
-    // body (FetchResponse v16)
-    Wi32(0);  // throttle_time_ms
-    Wi16(0);  // error_code
-    Wi32(0);  // session_id
-
-    // responses = compact array, 0 items → encoded as 1
-    Wb(0x01);
-
-    // response tagged fields
     Wb(0x00);
 
-    // finalize size
+    // body
+    Wi32(0); // throttle_time_ms
+    Wi16(0); // error_code
+    Wi32(0); // session_id
+
+    // responses empty → compact_array_length = 1
+    Wb(0x01);
+
+    // body tagged fields
+    Wb(0x00);
+
+    // fix size
     var res = bytes.ToArray();
     int size = res.Length - 4;
-    byte[] sizeBytes = BitConverter.GetBytes(size);
-    if (BitConverter.IsLittleEndian) Array.Reverse(sizeBytes);
-    Array.Copy(sizeBytes, 0, res, 0, 4);
+    byte[] sz = BitConverter.GetBytes(size);
+    if (BitConverter.IsLittleEndian) Array.Reverse(sz);
+    Array.Copy(sz, 0, res, 0, 4);
     return res;
 }
-
 static byte[] BuildDescribeTopicPartitionsResponseV0_OK_Multi(
     int correlationId,
     List<(string topicName, Guid topicId, List<int> partitionIds)> topics,
