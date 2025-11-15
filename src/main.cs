@@ -124,18 +124,36 @@ static async Task HandleClient(TcpClient client)
                 }
                 else if (apiKey == 1)
                 {
-                    Guid topicId = ParseFetchRequestTopicId(msg);
+                    // Fetch v16
+                    var (topicsCount, topicId) = ParseFetchRequestTopics(msg);
 
-                    if (topicId == Guid.Empty)
+                    if (topicsCount == 0)
                     {
+                        // DH6: Fetch with no topics
                         response = BuildFetchResponseNoTopicsV16(correlationId);
                     }
                     else
                     {
-                        response = BuildFetchResponseUnknownTopicV16(correlationId, topicId);
+                        // props + metadata log path (DescribeTopicPartitions’ta yaptığın gibi)
+                        string propsPath = Environment.GetCommandLineArgs().Length > 1
+                            ? Environment.GetCommandLineArgs()[1]
+                            : "/tmp/server.properties";
+
+                        string logPath = MetadataParser.GetMetadataLogPath(propsPath);
+
+                        bool exists = MetadataParser.TopicIdExists(logPath, topicId);
+
+                        if (!exists)
+                        {
+                            // HN6: Unknown topic id
+                            response = BuildFetchResponseUnknownTopicV16(correlationId, topicId);
+                        }
+                        else
+                        {
+                            // Bu stage: Topic var ama hiç mesaj yok
+                            response = BuildFetchResponseEmptyTopicV16(correlationId, topicId);
+                        }
                     }
-                   // response = BuildFetchResponseUnknownTopicV16(correlationId, topicId);
-                   // response = BuildFetchResponseV16(correlationId);
                 }
                 else
                 {
@@ -194,6 +212,50 @@ static int ReadUnsignedVarInt(byte[] b, ref int o)
         shift += 7;
     }
     return value;
+}
+
+static (int topicsCount, Guid topicId) ParseFetchRequestTopics(byte[] msg)
+{
+    int o = 0;
+
+    // ---- HEADER (v2) ----
+    o += 2; // apiKey
+    o += 2; // apiVersion
+    o += 4; // correlationId
+
+    short clientLen = ReadInt16BigEndian(msg, o);
+    o += 2;
+    if (clientLen > 0)
+        o += clientLen;
+
+    // header tagged fields
+    _ = ReadUnsignedVarInt(msg, ref o);
+
+    // ---- BODY (v16) ----
+    // DİKKAT: Body’de replica_id yok, atlamıyoruz.
+    o += 4; // max_wait_ms
+    o += 4; // min_bytes
+    o += 4; // max_bytes
+    o += 1; // isolation_level
+    o += 4; // session_id
+    o += 4; // session_epoch
+
+    // topics compact array length
+    int topicsLen = ReadUnsignedVarInt(msg, ref o);
+    int topicsCount = topicsLen - 1;
+
+    if (topicsCount == 0)
+        return (0, Guid.Empty);
+
+    // --- topic_id UUID (BE) ---
+    byte[] be = new byte[16];
+    Buffer.BlockCopy(msg, o, be, 0, 16);
+    o += 16;
+
+    byte[] le = KafkaProtocolUtils.BytesBigEndianToGuid(be);
+    Guid uuid = new Guid(le);
+
+    return (topicsCount, uuid);
 }
 
 static Guid ParseFetchRequestTopicId(byte[] msg)
@@ -287,6 +349,60 @@ static (List<string> topicNames, int responsePartitionLimit)
     return (topicNames, responsePartitionLimit);
 }
 // ---------- Response Builders ----------
+
+static byte[] BuildFetchResponseEmptyTopicV16(int correlationId, Guid topicId)
+{
+    var bytes = new List<byte>();
+    void B(byte v) => bytes.Add(v);
+    void I16(short v) { var x = BitConverter.GetBytes(v); if (BitConverter.IsLittleEndian) Array.Reverse(x); bytes.AddRange(x); }
+    void I32(int v) { var x = BitConverter.GetBytes(v); if (BitConverter.IsLittleEndian) Array.Reverse(x); bytes.AddRange(x); }
+    void I64(long v) { var x = BitConverter.GetBytes(v); if (BitConverter.IsLittleEndian) Array.Reverse(x); bytes.AddRange(x); }
+
+    // message_size placeholder
+    B(0); B(0); B(0); B(0);
+
+    // header
+    I32(correlationId);
+    B(0); // tagged fields
+
+    // body
+    I32(0);  // throttle_time
+    I16(0);  // error_code
+    I32(0);  // session_id
+
+    // responses array => 1 eleman => encode 2
+    B(0x02);
+
+    // topic id
+    bytes.AddRange(KafkaProtocolUtils.GuidToBytesBigEndian(topicId));
+
+    // partitions array => 1 eleman => encode 2
+    B(0x02);
+
+    // partition response
+    I32(0);      // partition index
+    I16(0);      // error code = OK
+    I64(0);      // high watermark
+    I64(0);      // last stable offset
+    I64(0);      // log start offset
+
+    B(0x01);     // aborted transactions empty
+    I32(-1);     // preferred_read_replica
+    B(0x00);     // records = null batch
+
+    B(0x00);     // partition tagged fields
+    B(0x00);     // topic tagged fields
+    B(0x00);     // body tagged fields
+
+    // fix size
+    var res = bytes.ToArray();
+    int size = res.Length - 4;
+    var sz = BitConverter.GetBytes(size);
+    if (BitConverter.IsLittleEndian) Array.Reverse(sz);
+    Array.Copy(sz, 0, res, 0, 4);
+
+    return res;
+}
 
 static byte[] BuildFetchResponseUnknownTopicV16(int correlationId, Guid topicId)
 {
@@ -708,6 +824,32 @@ static class MetadataParser
         return ids;
     }
 
+    public static bool TopicIdExists(string logPath, Guid topicId)
+    {
+        if (!File.Exists(logPath))
+            return false;
+
+        byte[] fileBytes = File.ReadAllBytes(logPath);
+        byte[] uuidBytes = KafkaProtocolUtils.GuidToBytesBigEndian(topicId);
+
+        for (int i = 0; i <= fileBytes.Length - 16; i++)
+        {
+            bool match = true;
+            for (int j = 0; j < 16; j++)
+            {
+                if (fileBytes[i + j] != uuidBytes[j])
+                {
+                    match = false;
+                    break;
+                }
+            }
+
+            if (match)
+                return true;
+        }
+
+        return false;
+    }
     public static string GetMetadataLogPath(string propertiesPath)
     {
         if (!File.Exists(propertiesPath))
