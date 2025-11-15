@@ -122,6 +122,10 @@ static async Task HandleClient(TcpClient client)
                         responsePartitionLimit //limit'i response builder'a geçir
                     );
                 }
+                else if (apiKey == 1)
+                {
+                    response = BuildFetchResponseV16(correlationId);
+                }
                 else
                 {
                     response = BuildApiVersionsResponseV4(correlationId, 0);
@@ -229,6 +233,41 @@ static (List<string> topicNames, int responsePartitionLimit)
     return (topicNames, responsePartitionLimit);
 }
 // ---------- Response Builders ----------
+
+static byte[] BuildFetchResponseV16(int correlationId)
+{
+    var bytes = new List<byte>();
+    void Wb(byte b) => bytes.Add(b);
+    void Wi16(short v) { var x = BitConverter.GetBytes(v); if (BitConverter.IsLittleEndian) Array.Reverse(x); bytes.AddRange(x); }
+    void Wi32(int v) { var x = BitConverter.GetBytes(v); if (BitConverter.IsLittleEndian) Array.Reverse(x); bytes.AddRange(x); }
+
+    // placeholder size
+    for (int i = 0; i < 4; i++) Wb(0x00);
+
+    // header
+    Wi32(correlationId);
+    Wb(0x00); // header tagged fields
+
+    // body (FetchResponse v16)
+    Wi32(0);  // throttle_time_ms
+    Wi16(0);  // error_code
+    Wi32(0);  // session_id
+
+    // responses = compact array, 0 items → encoded as 1
+    Wb(0x01);
+
+    // response tagged fields
+    Wb(0x00);
+
+    // finalize size
+    var res = bytes.ToArray();
+    int size = res.Length - 4;
+    byte[] sizeBytes = BitConverter.GetBytes(size);
+    if (BitConverter.IsLittleEndian) Array.Reverse(sizeBytes);
+    Array.Copy(sizeBytes, 0, res, 0, 4);
+    return res;
+}
+
 static byte[] BuildDescribeTopicPartitionsResponseV0_OK_Multi(
     int correlationId,
     List<(string topicName, Guid topicId, List<int> partitionIds)> topics,
